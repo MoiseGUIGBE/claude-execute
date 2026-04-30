@@ -165,6 +165,13 @@ What you get:
 
 Zero dependencies, reads `safety-check-log.json` and `trades.csv` directly. Auto-refreshes every 5 seconds.
 
+**Want to see the dashboard populated before running the bot?** Seed it with demo data:
+
+```bash
+node dashboard/seed-demo.cjs        # 12 sample decisions (3 PASS, 9 BLOCK)
+node dashboard/seed-demo.cjs reset  # remove demo data
+```
+
 ---
 
 ## Deploy to Railway (Run in the Cloud 24/7)
