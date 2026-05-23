@@ -1,4 +1,4 @@
-/**
+ /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
