@@ -122,15 +122,16 @@ async function fetchCandles(symbol, interval, limit = 100) {
     "1D": "1d",
     "1W": "1w",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  const bitgetInterval = intervalMap[interval] || "1min";
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const url = `https://api.bitget.com/api/v2/spot/market/candles?symbol=${symbol}&granularity=${bitgetInterval}&limit=${limit}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
+  if (!res.ok) throw new Error(`BitGet API error: ${res.status}`);
+  const json = await res.json();
+  const data = json.data || [];
 
   return data.map((k) => ({
-    time: k[0],
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
@@ -518,7 +519,7 @@ async function run() {
   }
 
   // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
+  console.log("\n── Fetching market data from BitGet ───────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
