@@ -20,7 +20,7 @@ function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
 
-  if (!existsSync(".env")) {
+  // Skip .env check in cloud/Railway environment
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
     );
@@ -41,9 +41,7 @@ function checkOnboarding() {
         "TIMEFRAME=4H",
       ].join("\n") + "\n",
     );
-    try {
-      execSync("open .env");
-    } catch {}
+    // cloud environment — no file to open
     console.log(
       "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
     );
