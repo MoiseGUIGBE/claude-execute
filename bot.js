@@ -107,10 +107,10 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// ─── Market Data (BitGet public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
+  // Map our timeframe format to BitGet interval format
   const intervalMap = {
     "1m": "1m",
     "3m": "3m",
