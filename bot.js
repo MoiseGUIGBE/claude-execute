@@ -1,13 +1,17 @@
 import "dotenv/config";
 import fs from "fs";
 import crypto from "crypto";
-
+{
+  "name": "claude-tradingview-mcp-trading",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
 // ───────────────── CONFIG ─────────────────
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
-  entryTF: "15m",
-  htfTF: "4h",
+  entryTF: "15min",
+  htfTF: "4H",
 
   paperTrading: process.env.PAPER_TRADING !== "false",
 
