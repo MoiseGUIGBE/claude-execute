@@ -1,65 +1,317 @@
 import "dotenv/config";
+import fetch from "node-fetch";
 import fs from "fs";
+import crypto from "crypto";
 
-const STATE_FILE = "state.json";
-const EQUITY_FILE = "equity.json";
-const SYMBOLS_FILE = "symbols.json";
+const ACCOUNT = {
+  balance:             parseFloat(process.env.ACCOUNT_BALANCE || "6000"),
+  riskPercent:         parseFloat(process.env.RISK_PERCENT    || "0.5"),
+  rewardRatio:         parseFloat(process.env.REWARD_RATIO    || "2"),
+  maxDailyLossPercent: 4.5,
+  maxTotalLossPercent: 9.5,
+  maxTradesPerDay:     3,
+  maxLossesPerDay:     2,
+};
 
-// =========================
-// STATE SYSTEM
-// =========================
-function load(file, fallback) {
+const SYMBOL           = process.env.SYMBOL         || "BTCUSDT";
+const EXCHANGE         = process.env.EXCHANGE        || "binance";
+const PAPER            = process.env.PAPER_TRADING  !== "false";
+const BINANCE_API_KEY  = process.env.BINANCE_API_KEY || "";
+const BINANCE_SECRET   = process.env.BINANCE_SECRET  || "";
+const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN  || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID|| "";
+const BINANCE_BASE     = "https://fapi.binance.com";
+const BITGET_BASE      = "https://api.bitget.com";
+
+const STATE_FILE  = "state.json";
+const TRADES_FILE = "trades.json";
+
+function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf-8"));
+    const s     = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const today = new Date().toISOString().slice(0, 10);
+    if (s.date !== today) {
+      return { date: today, trades: 0, losses: 0,
+               dailyPnL: 0, totalPnL: s.totalPnL || 0 };
+    }
+    return s;
   } catch {
-    return fallback;
+    return { date: new Date().toISOString().slice(0, 10),
+             trades: 0, losses: 0, dailyPnL: 0, totalPnL: 0 };
   }
 }
 
-function save(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+function saveState(s) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function saveTrade(t) {
+  let arr = [];
+  try { arr = JSON.parse(fs.readFileSync(TRADES_FILE, "utf8")); } catch {}
+  arr.push(t);
+  fs.writeFileSync(TRADES_FILE, JSON.stringify(arr, null, 2));
 }
 
-async function retry(fn, n = 3, delay = 800) {
-  for (let i = 0; i < n; i++) {
-    try { return await fn(); }
-    catch (e) {
-      if (i === n - 1) throw e;
-      await sleep(delay);
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function telegram(msg) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg }),
+    });
+  } catch {}
+}
+
+function isTradingSession() {
+  const h = new Date().getUTCHours();
+  const m = new Date().getUTCMinutes();
+  const t = h + m / 60;
+  const london  = t >= 8  && t < 11;
+  const newYork = t >= 13 && t < 17;
+  if (!london && !newYork) {
+    log(`❌ Outside sessions (UTC ${h}:${String(m).padStart(2,"0")})`);
+    return false;
+  }
+  log(`✅ Session: ${london ? "London 🇬🇧" : "New York 🇺🇸"}`);
+  return true;
+}
+
+function isNewsWindow() {
+  const h   = new Date().getUTCHours();
+  const m   = new Date().getUTCMinutes();
+  const now = h * 60 + m;
+  const events = [
+    { label: "NFP/CPI", h: 13, m: 30 },
+    { label: "FOMC",    h: 18, m:  0 },
+    { label: "FOMC",    h: 19, m:  0 },
+  ];
+  for (const e of events) {
+    const center = e.h * 60 + e.m;
+    if (now >= center - 30 && now <= center + 30) {
+      log(`⚠️  News window (${e.label}) — skipping.`);
+      return true;
     }
   }
+  return false;
 }
 
-// =========================
-// HEDGE FUND RISK ENGINE
-// =========================
-function equityCheck() {
-  const eq = load(EQUITY_FILE, { start: 1000, current: 1000 });
-  const dd = ((eq.current - eq.start) / eq.start) * 100;
-  return dd > -5;
+function passesRiskGuard(state) {
+  const dLimit = ACCOUNT.balance * ACCOUNT.maxDailyLossPercent / 100;
+  const tLimit = ACCOUNT.balance * ACCOUNT.maxTotalLossPercent / 100;
+  const rUSD   = ACCOUNT.balance * ACCOUNT.riskPercent / 100;
+
+  log(`📊 Trades: ${state.trades}/${ACCOUNT.maxTradesPerDay} | Losses: ${state.losses}/${ACCOUNT.maxLossesPerDay} | Daily P&L: $${state.dailyPnL.toFixed(2)} | Total P&L: $${state.totalPnL.toFixed(2)}`);
+  log(`💰 Risk/trade: $${rUSD.toFixed(2)} | Daily limit: $${dLimit.toFixed(2)} | Max DD: $${tLimit.toFixed(2)}`);
+
+  if (state.trades >= ACCOUNT.maxTradesPerDay) {
+    log(`🛑 Max trades/day reached.`); return false; }
+  if (state.losses >= ACCOUNT.maxLossesPerDay) {
+    log(`🛑 Max losses/day reached.`); return false; }
+  if (state.dailyPnL <= -dLimit) {
+    log(`🛑 Daily loss limit hit.`); return false; }
+  if (state.totalPnL <= -tLimit) {
+    log(`🚨 MAX DRAWDOWN HIT — STOP ALL TRADING.`); return false; }
+  return true;
 }
 
-function adaptiveRisk(state) {
-  const base = Number(process.env.RISK || 0.01);
-
-  // win streak scaling (institutional behavior)
-  if (state.winStreak >= 3) return base * 1.5;
-  if (state.winStreak >= 5) return base * 2;
-
-  // loss protection
-  if (state.lossStreak >= 2) return base * 0.5;
-
-  return base;
+function sign(query) {
+  return crypto.createHmac("sha256", BINANCE_SECRET).update(query).digest("hex");
 }
 
-// =========================
-// LIQUIDITY SWEEP FILTER (SIMPLIFIED SMC)
-// =========================
-function liquiditySweepFilter(signal) {
-  // expects signal.liquiditySweep = true from strategy layer
-  if (signal.liquiditySweep === false) return false;
+async function privateRequest(endpoint, method = "POST", params = {}) {
+  const query = new URLSearchParams({ ...params, timestamp: Date.now() }).toString();
+  const res   = await fetch(`${BINANCE_BASE}${endpoint}?${query}&signature=${sign(query)}`, {
+    method,
+    headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
+  });
+  return res.json();
 }
+
+async function getKlines(limit = 200) {
+  if (EXCHANGE === "bitget") {
+    const url  = `${BITGET_BASE}/api/v2/spot/market/candles?symbol=${SYMBOL}&granularity=15min&limit=${limit}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    return data.data.map(k => ({
+      open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
+    }));
+  } else {
+    const url  = `${BINANCE_BASE}/fapi/v1/klines?symbol=${SYMBOL}&interval=15m&limit=${limit}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    return data.map(k => ({
+      open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
+    }));
+  }
+}
+
+async function getPrice() {
+  if (EXCHANGE === "bitget") {
+    const res  = await fetch(`${BITGET_BASE}/api/v2/spot/market/tickers?symbol=${SYMBOL}`);
+    const data = await res.json();
+    return +data.data[0].lastPr;
+  } else {
+    const res  = await fetch(`${BINANCE_BASE}/fapi/v1/ticker/price?symbol=${SYMBOL}`);
+    const data = await res.json();
+    return +data.price;
+  }
+}
+
+async function hasOpenPosition() {
+  if (PAPER) return false;
+  try {
+    const data = await privateRequest("/fapi/v2/positionRisk", "GET");
+    const pos  = data.find(p => p.symbol === SYMBOL);
+    return pos && Math.abs(+pos.positionAmt) > 0;
+  } catch { return false; }
+}
+
+function calcEMA(candles, period = 200) {
+  const k = 2 / (period + 1);
+  let ema = candles[0].close;
+  for (let i = 1; i < candles.length; i++)
+    ema = candles[i].close * k + ema * (1 - k);
+  return ema;
+}
+
+function calcVWAP(candles) {
+  let tpv = 0, vol = 0;
+  for (const c of candles) {
+    const tp = (c.high + c.low + c.close) / 3;
+    tpv += tp * c.volume;
+    vol += c.volume;
+  }
+  return vol === 0 ? 0 : tpv / vol;
+}
+
+function calcATR(candles, period = 14) {
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i-1].close),
+      Math.abs(candles[i].low  - candles[i-1].close)
+    ));
+  }
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+function calcORB(candles, bars = 4) {
+  const orb = candles.slice(-bars);
+  return {
+    high: Math.max(...orb.map(c => c.high)),
+    low:  Math.min(...orb.map(c => c.low)),
+  };
+}
+
+function calcSize(entry, stop) {
+  const riskUSD = ACCOUNT.balance * (ACCOUNT.riskPercent / 100);
+  const dist    = Math.abs(entry - stop);
+  return dist === 0 ? 0 : riskUSD / dist;
+}
+
+async function executeTrade(signal, quantity, stop, target) {
+  if (PAPER) { log("📝 PAPER MODE — no real order sent."); return; }
+  const side = signal === "LONG" ? "BUY"  : "SELL";
+  const opp  = signal === "LONG" ? "SELL" : "BUY";
+  await privateRequest("/fapi/v1/order", "POST", {
+    symbol: SYMBOL, side, type: "MARKET", quantity });
+  await privateRequest("/fapi/v1/order", "POST", {
+    symbol: SYMBOL, side: opp, type: "STOP_MARKET",
+    stopPrice: stop.toFixed(2), closePosition: true });
+  await privateRequest("/fapi/v1/order", "POST", {
+    symbol: SYMBOL, side: opp, type: "TAKE_PROFIT_MARKET",
+    stopPrice: target.toFixed(2), closePosition: true });
+  log("🚀 LIVE ORDERS PLACED");
+}
+
+async function run() {
+  log("═══════════════════════════════════════════");
+  log(`💼 FundedNext ORB+VWAP Bot`);
+  log(`   Balance: $${ACCOUNT.balance} | Risk: ${ACCOUNT.riskPercent}% = $${(ACCOUNT.balance * ACCOUNT.riskPercent / 100).toFixed(2)}/trade`);
+  log(`   Exchange: ${EXCHANGE.toUpperCase()} | Symbol: ${SYMBOL} | Mode: ${PAPER ? "PAPER 📝" : "LIVE 🚀"}`);
+  log("═══════════════════════════════════════════");
+
+  if (!isTradingSession()) return;
+  if (isNewsWindow())      return;
+
+  const state = loadState();
+  if (!passesRiskGuard(state)) return;
+  if (await hasOpenPosition()) { log("⚠️  Position already open."); return; }
+
+  const [candles, price] = await Promise.all([getKlines(200), getPrice()]);
+
+  const ema    = calcEMA(candles, 200);
+  const vwap   = calcVWAP(candles);
+  const atr    = calcATR(candles, 14);
+  const orb    = calcORB(candles, 4);
+  const avgVol = candles.slice(-20).reduce((a, c) => a + c.volume, 0) / 20;
+  const curVol = candles[candles.length - 1].volume;
+
+  log(`📈 Price: $${price.toFixed(2)} | EMA200: $${ema.toFixed(2)} | VWAP: $${vwap.toFixed(2)} | ATR: ${atr.toFixed(2)}`);
+  log(`📦 ORB High: $${orb.high.toFixed(2)} | ORB Low: $${orb.low.toFixed(2)}`);
+  log(`📊 Volume: ${curVol.toFixed(0)} vs Avg: ${avgVol.toFixed(0)}`);
+
+  if (atr < price * 0.001) { log("⚠️  Low volatility — skip."); return; }
+  if (curVol < avgVol)     { log("⚠️  Weak volume — skip.");    return; }
+
+  let signal = null;
+  if (price > ema && price > vwap && price > orb.high) signal = "LONG";
+  else if (price < ema && price < vwap && price < orb.low) signal = "SHORT";
+
+  if (!signal) { log("⏳ No confirmed signal. Waiting."); return; }
+
+  const stop      = signal === "LONG" ? orb.low : orb.high;
+  const riskDist  = Math.abs(price - stop);
+  const target    = signal === "LONG"
+    ? price + riskDist * ACCOUNT.rewardRatio
+    : price - riskDist * ACCOUNT.rewardRatio;
+  const size      = calcSize(price, stop);
+  const riskUSD   = ACCOUNT.balance * ACCOUNT.riskPercent / 100;
+  const profitUSD = riskUSD * ACCOUNT.rewardRatio;
+
+  log("════════════ SIGNAL ════════════");
+  log(`🎯 ${signal}`);
+  log(`   Entry:   $${price.toFixed(2)}`);
+  log(`   Stop:    $${stop.toFixed(2)}  (risk $${riskUSD.toFixed(2)})`);
+  log(`   Target:  $${target.toFixed(2)}  (gain $${profitUSD.toFixed(2)})`);
+  log(`   Size:    ${size.toFixed(4)} units`);
+  log(`   RR:      1:${ACCOUNT.rewardRatio}`);
+  log("════════════════════════════════");
+
+  await telegram(
+    `🤖 FundedNext Bot — ${signal}\n` +
+    `📍 ${SYMBOL} @ $${price.toFixed(2)}\n` +
+    `🛑 Stop:   $${stop.toFixed(2)}\n` +
+    `💰 Target: $${target.toFixed(2)}\n` +
+    `📦 Size:   ${size.toFixed(4)}\n` +
+    `⚡ Risk:   $${riskUSD.toFixed(2)} | RR 1:${ACCOUNT.rewardRatio}\n` +
+    `🏦 ${PAPER ? "PAPER MODE" : "LIVE TRADE"}`
+  );
+
+  await executeTrade(signal, size.toFixed(3), stop, target);
+
+  state.trades += 1;
+  saveState(state);
+  saveTrade({
+    time: new Date().toISOString(),
+    exchange: EXCHANGE, symbol: SYMBOL, signal,
+    entry: price, stop: +stop.toFixed(2), target: +target.toFixed(2),
+    size: +size.toFixed(4), riskUSD: +riskUSD.toFixed(2),
+    profitUSD: +profitUSD.toFixed(2), rr: `1:${ACCOUNT.rewardRatio}`,
+    paper: PAPER,
+  });
+
+  log("✅ Trade logged successfully.");
+}
+
+run().catch(async err => {
+  log(`💥 ERROR: ${err.message}`);
+  await telegram(`💥 BOT ERROR\n${err.message}`);
+  process.exit(1);
+});
