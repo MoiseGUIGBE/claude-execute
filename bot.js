@@ -1,5 +1,5 @@
 import "dotenv/config";
-import fetch from "node-fetch";
+
 import fs from "fs";
 import crypto from "crypto";
 
