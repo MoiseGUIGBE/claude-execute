@@ -1,11 +1,12 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
-  "build": {
-    "builder": "NIXPACKS"
+  "name": "fundednext-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
   },
-  "deploy": {
-    "startCommand": "node bot.js",
-    "cronSchedule": "*/15 13-21 * * 1-5",
-    "restartPolicyType": "NEVER"
+  "dependencies": {
+    "dotenv": "^16.4.5"
   }
 }
