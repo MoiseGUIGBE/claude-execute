@@ -1,18 +1,39 @@
 {
-  "name": "claude-tradingview-mcp-trading",
-  "version": "1.0.0",
-  "description": "Automated trading bot — Claude + TradingView strategy + BitGet execution",
+  "name": "institutional-prop-bot",
+  "version": "2.0.0",
+  "description": "Institutional prop-style automated trading bot with Binance/BitGet execution",
   "main": "bot.js",
+  "type": "module",
+
   "scripts": {
     "start": "node bot.js",
-    "dev": "node bot.js",
-    "dashboard": "node dashboard/server.cjs"
+    "dev": "node --watch bot.js",
+    "dashboard": "node dashboard/server.cjs",
+    "logs": "pm2 logs propbot",
+    "restart": "pm2 restart propbot",
+    "stop": "pm2 stop propbot"
   },
+
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2"
   },
+
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+
+  "keywords": [
+    "trading",
+    "binance",
+    "bitget",
+    "prop-firm",
+    "algorithmic-trading",
+    "crypto-bot",
+    "fundednext",
+    "ftmo"
+  ],
+
+  "author": "Moise Guigbe",
+  "license": "MIT"
 }
