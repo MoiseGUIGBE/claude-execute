@@ -1,5 +1,5 @@
 {
-  "name": "fundednext-bot",
+  "name": "trading-bot",
   "version": "1.0.0",
   "type": "module",
   "main": "bot.js",
