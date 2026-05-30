@@ -1,5 +1,4 @@
-/**
- * Claude + TradingView MCP — Automated Trading Bot
+* Claude + TradingView MCP — Automated Trading Bot
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
  * Binance (free, no auth), calculates all indicators, runs safety check,
