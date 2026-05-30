@@ -1,317 +1,186 @@
 import "dotenv/config";
-
 import fs from "fs";
 import crypto from "crypto";
 
-const ACCOUNT = {
-  balance:             parseFloat(process.env.ACCOUNT_BALANCE || "6000"),
-  riskPercent:         parseFloat(process.env.RISK_PERCENT    || "0.5"),
-  rewardRatio:         parseFloat(process.env.REWARD_RATIO    || "2"),
-  maxDailyLossPercent: 4.5,
-  maxTotalLossPercent: 9.5,
-  maxTradesPerDay:     3,
-  maxLossesPerDay:     2,
+const CONFIG = {
+  symbol:        process.env.SYMBOL             || "BTCUSDT",
+  timeframe:     "15min",
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "100"),
+  riskPerTrade:  parseFloat(process.env.RISK_PER_TRADE       || "0.005"),
+  rrRatio:       2.0,
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY   || "3"),
+  maxDailyLoss:  parseFloat(process.env.MAX_DAILY_LOSS       || "0.05"),
+  maxDrawdown:   parseFloat(process.env.MAX_DRAWDOWN         || "0.10"),
+  orbStartUTC:   13 * 60 + 30,
+  orbEndUTC:     13 * 60 + 45,
+  tradeStartUTC: 13 * 60 + 45,
+  tradeEndUTC:   21 * 60,
+  paperTrading:  process.env.PAPER_TRADING !== "false",
+  bitget: {
+    apiKey:     process.env.BITGET_API_KEY     || "",
+    secretKey:  process.env.BITGET_SECRET_KEY  || "",
+    passphrase: process.env.BITGET_PASSPHRASE  || "",
+    baseUrl:    process.env.BITGET_BASE_URL    || "https://api.bitget.com",
+  },
 };
 
-const SYMBOL           = process.env.SYMBOL         || "BTCUSDT";
-const EXCHANGE         = process.env.EXCHANGE        || "binance";
-const PAPER            = process.env.PAPER_TRADING  !== "false";
-const BINANCE_API_KEY  = process.env.BINANCE_API_KEY || "";
-const BINANCE_SECRET   = process.env.BINANCE_SECRET  || "";
-const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN  || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID|| "";
-const BINANCE_BASE     = "https://fapi.binance.com";
-const BITGET_BASE      = "https://api.bitget.com";
-
-const STATE_FILE  = "state.json";
-const TRADES_FILE = "trades.json";
+const STATE_FILE = "state.json";
 
 function loadState() {
-  try {
-    const s     = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    const today = new Date().toISOString().slice(0, 10);
-    if (s.date !== today) {
-      return { date: today, trades: 0, losses: 0,
-               dailyPnL: 0, totalPnL: s.totalPnL || 0 };
-    }
-    return s;
-  } catch {
-    return { date: new Date().toISOString().slice(0, 10),
-             trades: 0, losses: 0, dailyPnL: 0, totalPnL: 0 };
-  }
+  const today = new Date().toISOString().slice(0, 10);
+  if (!fs.existsSync(STATE_FILE)) return { date: today, tradesToday: 0, dailyPnL: 0, peakValue: CONFIG.portfolioValue, openPosition: false };
+  const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  if (s.date !== today) return { date: today, tradesToday: 0, dailyPnL: 0, peakValue: s.peakValue || CONFIG.portfolioValue, openPosition: false };
+  return s;
 }
 
-function saveState(s) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
+
+const CSV_FILE = "trades.csv";
+const CSV_HEADER = "Date,Time,Symbol,Side,Entry,SL,TP,Qty,RR,Risk$,Mode,OrderId,Notes";
+
+function initCsv() {
+  if (!fs.existsSync(CSV_FILE)) { fs.writeFileSync(CSV_FILE, CSV_HEADER + "\n"); }
 }
 
-function saveTrade(t) {
-  let arr = [];
-  try { arr = JSON.parse(fs.readFileSync(TRADES_FILE, "utf8")); } catch {}
-  arr.push(t);
-  fs.writeFileSync(TRADES_FILE, JSON.stringify(arr, null, 2));
+function logTrade(t) {
+  const d = new Date(t.timestamp);
+  const row = [d.toISOString().slice(0,10), d.toISOString().slice(11,19), t.symbol, t.side,
+    t.entry?.toFixed(2)??"", t.stopLoss?.toFixed(2)??"", t.takeProfit?.toFixed(2)??"",
+    t.qty?.toFixed(6)??"", t.rr?.toFixed(1)??"", t.riskUSD?.toFixed(2)??"",
+    t.mode, t.orderId??"", `"${t.notes??""}"`,
+  ].join(",");
+  fs.appendFileSync(CSV_FILE, row + "\n");
+  console.log("📝 Trade logged → " + CSV_FILE);
 }
 
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-async function telegram(msg) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg }),
-    });
-  } catch {}
-}
-
-function isTradingSession() {
-  const h = new Date().getUTCHours();
-  const m = new Date().getUTCMinutes();
-  const t = h + m / 60;
-  const london  = t >= 8  && t < 11;
-  const newYork = t >= 13 && t < 17;
-  if (!london && !newYork) {
-    log(`❌ Outside sessions (UTC ${h}:${String(m).padStart(2,"0")})`);
-    return false;
-  }
-  log(`✅ Session: ${london ? "London 🇬🇧" : "New York 🇺🇸"}`);
-  return true;
-}
-
-function isNewsWindow() {
-  const h   = new Date().getUTCHours();
-  const m   = new Date().getUTCMinutes();
-  const now = h * 60 + m;
-  const events = [
-    { label: "NFP/CPI", h: 13, m: 30 },
-    { label: "FOMC",    h: 18, m:  0 },
-    { label: "FOMC",    h: 19, m:  0 },
-  ];
-  for (const e of events) {
-    const center = e.h * 60 + e.m;
-    if (now >= center - 30 && now <= center + 30) {
-      log(`⚠️  News window (${e.label}) — skipping.`);
-      return true;
-    }
-  }
-  return false;
-}
-
-function passesRiskGuard(state) {
-  const dLimit = ACCOUNT.balance * ACCOUNT.maxDailyLossPercent / 100;
-  const tLimit = ACCOUNT.balance * ACCOUNT.maxTotalLossPercent / 100;
-  const rUSD   = ACCOUNT.balance * ACCOUNT.riskPercent / 100;
-
-  log(`📊 Trades: ${state.trades}/${ACCOUNT.maxTradesPerDay} | Losses: ${state.losses}/${ACCOUNT.maxLossesPerDay} | Daily P&L: $${state.dailyPnL.toFixed(2)} | Total P&L: $${state.totalPnL.toFixed(2)}`);
-  log(`💰 Risk/trade: $${rUSD.toFixed(2)} | Daily limit: $${dLimit.toFixed(2)} | Max DD: $${tLimit.toFixed(2)}`);
-
-  if (state.trades >= ACCOUNT.maxTradesPerDay) {
-    log(`🛑 Max trades/day reached.`); return false; }
-  if (state.losses >= ACCOUNT.maxLossesPerDay) {
-    log(`🛑 Max losses/day reached.`); return false; }
-  if (state.dailyPnL <= -dLimit) {
-    log(`🛑 Daily loss limit hit.`); return false; }
-  if (state.totalPnL <= -tLimit) {
-    log(`🚨 MAX DRAWDOWN HIT — STOP ALL TRADING.`); return false; }
-  return true;
-}
-
-function sign(query) {
-  return crypto.createHmac("sha256", BINANCE_SECRET).update(query).digest("hex");
-}
-
-async function privateRequest(endpoint, method = "POST", params = {}) {
-  const query = new URLSearchParams({ ...params, timestamp: Date.now() }).toString();
-  const res   = await fetch(`${BINANCE_BASE}${endpoint}?${query}&signature=${sign(query)}`, {
-    method,
-    headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
-  });
-  return res.json();
-}
-
-async function getKlines(limit = 200) {
-  if (EXCHANGE === "bitget") {
-    const url  = `${BITGET_BASE}/api/v2/spot/market/candles?symbol=${SYMBOL}&granularity=15min&limit=${limit}`;
-    const res  = await fetch(url);
-    const data = await res.json();
-    return data.data.map(k => ({
-      open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
-    }));
-  } else {
-    const url  = `${BINANCE_BASE}/fapi/v1/klines?symbol=${SYMBOL}&interval=15m&limit=${limit}`;
-    const res  = await fetch(url);
-    const data = await res.json();
-    return data.map(k => ({
-      open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
-    }));
-  }
-}
-
-async function getPrice() {
-  if (EXCHANGE === "bitget") {
-    const res  = await fetch(`${BITGET_BASE}/api/v2/spot/market/tickers?symbol=${SYMBOL}`);
-    const data = await res.json();
-    return +data.data[0].lastPr;
-  } else {
-    const res  = await fetch(`${BINANCE_BASE}/fapi/v1/ticker/price?symbol=${SYMBOL}`);
-    const data = await res.json();
-    return +data.price;
-  }
-}
-
-async function hasOpenPosition() {
-  if (PAPER) return false;
-  try {
-    const data = await privateRequest("/fapi/v2/positionRisk", "GET");
-    const pos  = data.find(p => p.symbol === SYMBOL);
-    return pos && Math.abs(+pos.positionAmt) > 0;
-  } catch { return false; }
-}
-
-function calcEMA(candles, period = 200) {
-  const k = 2 / (period + 1);
-  let ema = candles[0].close;
-  for (let i = 1; i < candles.length; i++)
-    ema = candles[i].close * k + ema * (1 - k);
-  return ema;
+async function fetchCandles(symbol, interval, limit = 300) {
+  const url = `${CONFIG.bitget.baseUrl}/api/v2/spot/market/candles?symbol=${symbol}&granularity=${interval}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("BitGet candles error: " + res.status);
+  const json = await res.json();
+  return (json.data || []).map(k => ({ time: Number(k[0]), open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]), volume: Number(k[5]) }));
 }
 
 function calcVWAP(candles) {
+  const todayStart = new Date(); todayStart.setUTCHours(0,0,0,0);
+  const src = candles.filter(c => c.time >= todayStart.getTime());
+  const data = src.length > 0 ? src : candles;
   let tpv = 0, vol = 0;
-  for (const c of candles) {
-    const tp = (c.high + c.low + c.close) / 3;
-    tpv += tp * c.volume;
-    vol += c.volume;
-  }
-  return vol === 0 ? 0 : tpv / vol;
+  data.forEach(c => { const tp = (c.high + c.low + c.close) / 3; tpv += tp * c.volume; vol += c.volume; });
+  return vol === 0 ? null : tpv / vol;
 }
 
-function calcATR(candles, period = 14) {
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    trs.push(Math.max(
-      candles[i].high - candles[i].low,
-      Math.abs(candles[i].high - candles[i-1].close),
-      Math.abs(candles[i].low  - candles[i-1].close)
-    ));
-  }
-  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+function calcORB(candles) {
+  const orb = candles.filter(c => { const m = Math.floor(c.time / 60000) % 1440; return m >= CONFIG.orbStartUTC && m < CONFIG.orbEndUTC; });
+  if (orb.length === 0) return { orbHigh: null, orbLow: null };
+  return { orbHigh: Math.max(...orb.map(c => c.high)), orbLow: Math.min(...orb.map(c => c.low)) };
 }
 
-function calcORB(candles, bars = 4) {
-  const orb = candles.slice(-bars);
-  return {
-    high: Math.max(...orb.map(c => c.high)),
-    low:  Math.min(...orb.map(c => c.low)),
-  };
+function signBitGet(ts, method, path, body = "") {
+  return crypto.createHmac("sha256", CONFIG.bitget.secretKey).update(`${ts}${method}${path}${body}`).digest("base64");
 }
 
-function calcSize(entry, stop) {
-  const riskUSD = ACCOUNT.balance * (ACCOUNT.riskPercent / 100);
-  const dist    = Math.abs(entry - stop);
-  return dist === 0 ? 0 : riskUSD / dist;
-}
-
-async function executeTrade(signal, quantity, stop, target) {
-  if (PAPER) { log("📝 PAPER MODE — no real order sent."); return; }
-  const side = signal === "LONG" ? "BUY"  : "SELL";
-  const opp  = signal === "LONG" ? "SELL" : "BUY";
-  await privateRequest("/fapi/v1/order", "POST", {
-    symbol: SYMBOL, side, type: "MARKET", quantity });
-  await privateRequest("/fapi/v1/order", "POST", {
-    symbol: SYMBOL, side: opp, type: "STOP_MARKET",
-    stopPrice: stop.toFixed(2), closePosition: true });
-  await privateRequest("/fapi/v1/order", "POST", {
-    symbol: SYMBOL, side: opp, type: "TAKE_PROFIT_MARKET",
-    stopPrice: target.toFixed(2), closePosition: true });
-  log("🚀 LIVE ORDERS PLACED");
+async function placeOrder(side, qty) {
+  const ts = Date.now().toString();
+  const path = "/api/v2/spot/trade/placeOrder";
+  const body = JSON.stringify({ symbol: CONFIG.symbol, side, orderType: "market", quantity: qty.toFixed(6), force: "gtc" });
+  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "ACCESS-KEY": CONFIG.bitget.apiKey, "ACCESS-SIGN": signBitGet(ts, "POST", path, body), "ACCESS-TIMESTAMP": ts, "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase },
+    body,
+  });
+  const data = await res.json();
+  if (data.code !== "00000") throw new Error("BitGet: " + data.msg);
+  return data.data;
 }
 
 async function run() {
-  log("═══════════════════════════════════════════");
-  log(`💼 FundedNext ORB+VWAP Bot`);
-  log(`   Balance: $${ACCOUNT.balance} | Risk: ${ACCOUNT.riskPercent}% = $${(ACCOUNT.balance * ACCOUNT.riskPercent / 100).toFixed(2)}/trade`);
-  log(`   Exchange: ${EXCHANGE.toUpperCase()} | Symbol: ${SYMBOL} | Mode: ${PAPER ? "PAPER 📝" : "LIVE 🚀"}`);
-  log("═══════════════════════════════════════════");
-
-  if (!isTradingSession()) return;
-  if (isNewsWindow())      return;
-
+  initCsv();
   const state = loadState();
-  if (!passesRiskGuard(state)) return;
-  if (await hasOpenPosition()) { log("⚠️  Position already open."); return; }
+  const now = new Date();
+  const utcH = now.getUTCHours();
+  const utcM = now.getUTCMinutes();
+  const totalMin = utcH * 60 + utcM;
+  const isWeekend = [0, 6].includes(now.getUTCDay());
 
-  const [candles, price] = await Promise.all([getKlines(200), getPrice()]);
+  console.log("\n═══════════════════════════════════════════════");
+  console.log("  ORB + VWAP Bot — FundedNext Compliant");
+  console.log("  " + now.toISOString());
+  console.log("  Mode: " + (CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"));
+  console.log("  Symbol: " + CONFIG.symbol + " | Portfolio: $" + CONFIG.portfolioValue);
+  console.log("  Trades today: " + state.tradesToday + "/" + CONFIG.maxTradesPerDay);
+  console.log("  Daily P&L: " + (state.dailyPnL * 100).toFixed(2) + "%");
+  console.log("═══════════════════════════════════════════════\n");
 
-  const ema    = calcEMA(candles, 200);
-  const vwap   = calcVWAP(candles);
-  const atr    = calcATR(candles, 14);
-  const orb    = calcORB(candles, 4);
-  const avgVol = candles.slice(-20).reduce((a, c) => a + c.volume, 0) / 20;
-  const curVol = candles[candles.length - 1].volume;
+  if (isWeekend) { console.log("📅 Weekend — no trading (FundedNext rule)"); return; }
+  if (totalMin < CONFIG.orbStartUTC || totalMin > CONFIG.tradeEndUTC) { console.log("⏰ Outside trading window — exiting"); return; }
+  if (state.dailyPnL <= -CONFIG.maxDailyLoss) { console.log("🛑 Daily loss limit hit — stopping"); return; }
+  if (state.tradesToday >= CONFIG.maxTradesPerDay) { console.log("🚫 Max trades/day reached"); return; }
+  if (state.openPosition) { console.log("🚫 Position already open"); return; }
 
-  log(`📈 Price: $${price.toFixed(2)} | EMA200: $${ema.toFixed(2)} | VWAP: $${vwap.toFixed(2)} | ATR: ${atr.toFixed(2)}`);
-  log(`📦 ORB High: $${orb.high.toFixed(2)} | ORB Low: $${orb.low.toFixed(2)}`);
-  log(`📊 Volume: ${curVol.toFixed(0)} vs Avg: ${avgVol.toFixed(0)}`);
+  console.log("── Fetching market data ────────────────────────\n");
+  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 300);
+  const price = candles.at(-1).close;
+  const prev = candles.at(-2)?.close ?? price;
+  const vwap = calcVWAP(candles);
+  const { orbHigh, orbLow } = calcORB(candles);
 
-  if (atr < price * 0.001) { log("⚠️  Low volatility — skip."); return; }
-  if (curVol < avgVol)     { log("⚠️  Weak volume — skip.");    return; }
+  console.log("  Price:    $" + price.toFixed(2));
+  console.log("  VWAP:     $" + (vwap?.toFixed(2) ?? "N/A"));
+  console.log("  ORB High: $" + (orbHigh?.toFixed(2) ?? "Not formed"));
+  console.log("  ORB Low:  $" + (orbLow?.toFixed(2) ?? "Not formed"));
 
-  let signal = null;
-  if (price > ema && price > vwap && price > orb.high) signal = "LONG";
-  else if (price < ema && price < vwap && price < orb.low) signal = "SHORT";
+  if (!orbHigh || !orbLow) { console.log("\n⏳ ORB not formed yet"); return; }
+  if (totalMin < CONFIG.tradeStartUTC) { console.log("\n⏳ Waiting for ORB to complete (9:45 NY)"); return; }
 
-  if (!signal) { log("⏳ No confirmed signal. Waiting."); return; }
+  const orbRange = orbHigh - orbLow;
+  if (orbRange < price * 0.001) { console.log("\n⚠️  ORB range too small — skipping"); return; }
 
-  const stop      = signal === "LONG" ? orb.low : orb.high;
-  const riskDist  = Math.abs(price - stop);
-  const target    = signal === "LONG"
-    ? price + riskDist * ACCOUNT.rewardRatio
-    : price - riskDist * ACCOUNT.rewardRatio;
-  const size      = calcSize(price, stop);
-  const riskUSD   = ACCOUNT.balance * ACCOUNT.riskPercent / 100;
-  const profitUSD = riskUSD * ACCOUNT.rewardRatio;
+  console.log("\n── Signal Check ────────────────────────────────\n");
+  const brokeAboveORB = prev <= orbHigh && price > orbHigh;
+  const aboveVWAP = vwap ? price > vwap : false;
 
-  log("════════════ SIGNAL ════════════");
-  log(`🎯 ${signal}`);
-  log(`   Entry:   $${price.toFixed(2)}`);
-  log(`   Stop:    $${stop.toFixed(2)}  (risk $${riskUSD.toFixed(2)})`);
-  log(`   Target:  $${target.toFixed(2)}  (gain $${profitUSD.toFixed(2)})`);
-  log(`   Size:    ${size.toFixed(4)} units`);
-  log(`   RR:      1:${ACCOUNT.rewardRatio}`);
-  log("════════════════════════════════");
+  console.log("  Broke above ORB: " + (brokeAboveORB ? "✅" : "🚫"));
+  console.log("  Above VWAP:      " + (aboveVWAP ? "✅" : "🚫"));
 
-  await telegram(
-    `🤖 FundedNext Bot — ${signal}\n` +
-    `📍 ${SYMBOL} @ $${price.toFixed(2)}\n` +
-    `🛑 Stop:   $${stop.toFixed(2)}\n` +
-    `💰 Target: $${target.toFixed(2)}\n` +
-    `📦 Size:   ${size.toFixed(4)}\n` +
-    `⚡ Risk:   $${riskUSD.toFixed(2)} | RR 1:${ACCOUNT.rewardRatio}\n` +
-    `🏦 ${PAPER ? "PAPER MODE" : "LIVE TRADE"}`
-  );
+  if (!brokeAboveORB || !aboveVWAP) { console.log("\n⏳ No signal — waiting"); return; }
 
-  await executeTrade(signal, size.toFixed(3), stop, target);
+  const riskUSD = CONFIG.portfolioValue * CONFIG.riskPerTrade;
+  const stopDistance = price - orbLow;
+  const takeProfit = price + stopDistance * CONFIG.rrRatio;
+  const qty = riskUSD / stopDistance;
 
-  state.trades += 1;
+  console.log("\n✅ SIGNAL CONFIRMED — LONG");
+  console.log("   Entry:  $" + price.toFixed(2));
+  console.log("   SL:     $" + orbLow.toFixed(2));
+  console.log("   TP:     $" + takeProfit.toFixed(2));
+  console.log("   Risk:   $" + riskUSD.toFixed(2) + " (0.5%)");
+  console.log("   Qty:    " + qty.toFixed(6));
+
+  const trade = { timestamp: now.toISOString(), symbol: CONFIG.symbol, side: "buy", entry: price, stopLoss: orbLow, takeProfit, qty, rr: CONFIG.rrRatio, riskUSD, mode: CONFIG.paperTrading ? "PAPER" : "LIVE", orderId: null, notes: "" };
+
+  if (CONFIG.paperTrading) {
+    console.log("\n📋 PAPER TRADE — BUY $" + (qty * price).toFixed(2));
+    trade.orderId = "PAPER-" + Date.now();
+    trade.notes = "ORB + VWAP confirmed";
+  } else {
+    try {
+      const order = await placeOrder("buy", qty);
+      trade.orderId = order.orderId;
+      trade.notes = "ORB + VWAP confirmed";
+      console.log("✅ ORDER PLACED — " + order.orderId);
+    } catch (err) {
+      console.log("❌ ORDER FAILED — " + err.message);
+      trade.notes = "Error: " + err.message;
+    }
+  }
+
+  logTrade(trade);
+  state.openPosition = true;
+  state.tradesToday += 1;
   saveState(state);
-  saveTrade({
-    time: new Date().toISOString(),
-    exchange: EXCHANGE, symbol: SYMBOL, signal,
-    entry: price, stop: +stop.toFixed(2), target: +target.toFixed(2),
-    size: +size.toFixed(4), riskUSD: +riskUSD.toFixed(2),
-    profitUSD: +profitUSD.toFixed(2), rr: `1:${ACCOUNT.rewardRatio}`,
-    paper: PAPER,
-  });
-
-  log("✅ Trade logged successfully.");
+  console.log("\n═══════════════════════════════════════════════\n");
 }
 
-run().catch(async err => {
-  log(`💥 ERROR: ${err.message}`);
-  await telegram(`💥 BOT ERROR\n${err.message}`);
-  process.exit(1);
-});
+run().catch(err => { console.error("❌ Bot error:", err.message); process.exit(1); });
